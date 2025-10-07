@@ -1,4 +1,5 @@
 import os
+import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -6,7 +7,7 @@ from utils.metrics import compute_metrics
 from utils.utils import *
 
 
-def test_one_epoch(epoch, test_dataloader, model, criterion, save_dir, logger_val, tb_logger):
+def test_one_epoch(epoch, test_dataloader, model, criterion, logger_val, tb_logger):
     model.eval()
     device = next(model.parameters()).device
 
@@ -38,11 +39,6 @@ def test_one_epoch(epoch, test_dataloader, model, criterion, save_dir, logger_va
             psnr.update(p)
             ms_ssim.update(m)
 
-            if not os.path.exists(save_dir):
-                os.makedirs(save_dir)
-            rec.save(os.path.join(save_dir, '%03d_rec.png' % i))
-            img.save(os.path.join(save_dir, '%03d_gt.png' % i))
-
     tb_logger.add_scalar('{}'.format('[val]: loss'), loss.avg, epoch + 1)
     tb_logger.add_scalar('{}'.format('[val]: bpp_loss'), bpp_loss.avg, epoch + 1)
     tb_logger.add_scalar('{}'.format('[val]: psnr'), psnr.avg, epoch + 1)
@@ -56,7 +52,7 @@ def test_one_epoch(epoch, test_dataloader, model, criterion, save_dir, logger_va
             f"Bpp loss: {bpp_loss.avg:.4f} | "
             f"Aux loss: {aux_loss.avg:.2f} | "
             f"PSNR: {psnr.avg:.6f} | "
-            f"MS-SSIM: {ms_ssim.avg:.6f}"
+            f"MS-SSIM: {ms_ssim.avg:.6f} | "
         )
         tb_logger.add_scalar('{}'.format('[val]: mse_loss'), mse_loss.avg, epoch + 1)
     if out_criterion["ms_ssim_loss"] is not None:
@@ -67,7 +63,7 @@ def test_one_epoch(epoch, test_dataloader, model, criterion, save_dir, logger_va
             f"Bpp loss: {bpp_loss.avg:.4f} | "
             f"Aux loss: {aux_loss.avg:.2f} | "
             f"PSNR: {psnr.avg:.6f} | "
-            f"MS-SSIM: {ms_ssim.avg:.6f}"
+            f"MS-SSIM: {ms_ssim.avg:.6f} | "
         )
         tb_logger.add_scalar('{}'.format('[val]: ms_ssim_loss'), ms_ssim_loss.avg, epoch + 1)
 
