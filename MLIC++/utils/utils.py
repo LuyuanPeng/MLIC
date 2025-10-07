@@ -1,5 +1,6 @@
 import PIL.Image as Image
 import shutil
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -113,7 +114,19 @@ def save_checkpoint(state, is_best, filename="checkpoint.pth.tar"):
     torch.save(state, filename)
     if is_best:
         best_filename = filename.replace(filename.split('/')[-1], "checkpoint_best_loss.pth.tar")
-        shutil.copyfile(filename, best_filename)
+        try:
+            # Avoid copying if source and destination are the same file
+            if os.path.abspath(filename) != os.path.abspath(best_filename):
+                shutil.copyfile(filename, best_filename)
+        except shutil.SameFileError:
+            # Source and destination are the same file; nothing to do
+            pass
+        except Exception as e:
+            # Don't crash the training loop if copy fails; log and continue
+            try:
+                print(f"Warning: could not copy checkpoint to best file: {e}")
+            except Exception:
+                pass
 
 
 def split_data(source_path, destination_path, train_file):

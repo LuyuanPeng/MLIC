@@ -21,6 +21,7 @@ from config.config import model_config
 from models import *
 from torchvision.transforms import functional as F
 from pathlib import Path
+import json
 
 def main():
     torch.backends.cudnn.benchmark = True
@@ -255,7 +256,7 @@ def main():
 
             if checkpoint_path_local is None or not os.path.exists(checkpoint_path_local):
                 logger_val.error(f'No checkpoint found for evaluation at {checkpoint_path_local}')
-                return
+                return None
 
             save_dir = args.eval_save_dir or os.path.join(exp_dir, 'eval_results')
             os.makedirs(save_dir, exist_ok=True)
@@ -293,12 +294,34 @@ def main():
             # run evaluation using test_model helper
             test_model(test_dataloader, net_eval, logger_test, save_dir, ckpt.get('epoch', 0))
 
+            # Collect summary information (checkpoint info + eval folder). test_model currently logs metrics
+            summary = {
+                'lambda': l,
+                'checkpoint': os.path.abspath(checkpoint_path_local),
+                'checkpoint_epoch': int(ckpt.get('epoch', 0)) if ckpt is not None else None,
+                'checkpoint_loss': float(ckpt.get('loss')) if ckpt is not None and 'loss' in ckpt else None,
+                'eval_save_dir': os.path.abspath(save_dir),
+                'eval_metrics': None  # placeholder; test_model logs metrics but does not return structured metrics
+            }
+
+            # write summary json into experiment folder
+            try:
+                summary_path = os.path.join(exp_dir, 'eval_summary.json')
+                with open(summary_path, 'w') as f:
+                    json.dump(summary, f, indent=2)
+                logger_test.info(f'Evaluation summary written to {summary_path}')
+            except Exception as e:
+                logger_test.warning(f'Could not write evaluation summary: {e}')
+
+            return summary
+
         # Run evaluation-only mode or evaluate after training
         if args.eval_only:
-            run_evaluation(args.eval_checkpoint)
+            summary = run_evaluation(args.eval_checkpoint)
+            # if eval_only, we can write/print the summary (already written inside run_evaluation)
         elif args.evaluate:
             # evaluate the model saved for this lambda (best or provided)
-            run_evaluation(args.eval_checkpoint)
+            summary = run_evaluation(args.eval_checkpoint)
 
 
 
