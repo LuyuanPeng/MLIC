@@ -20,6 +20,7 @@ import argparse
 from config.config import model_config
 from models import *
 from torchvision.transforms import functional as F
+from pathlib import Path
 
 def main():
     torch.backends.cudnn.benchmark = True
@@ -48,6 +49,14 @@ def main():
     parser.add_argument('-c', '--checkpoint', default=None, type=str, help="pretrained model path")
     parser.add_argument('--world_size', type=int, default=1, help="World size for distributed training")
     parser.add_argument('--dist_url', type=str, default='tcp://localhost:8888', help="URL for distributed training")
+    # Evaluation options
+    parser.add_argument('--evaluate', action='store_true', help='Run evaluation after training for each lambda')
+    parser.add_argument('--eval-only', action='store_true', help='Only run evaluation, skip training')
+    parser.add_argument('--eval-dataset', type=str, default=None, help='Path to evaluation dataset')
+    parser.add_argument('--eval-batch-size', type=int, default=1, help='Evaluation batch size')
+    parser.add_argument('--eval-num-workers', type=int, default=4, help='Evaluation dataloader workers')
+    parser.add_argument('--eval-checkpoint', type=str, default=None, help='Checkpoint path to use for evaluation (overrides best)')
+    parser.add_argument('--eval-save-dir', type=str, default=None, help='Directory to save evaluation results (default: <experiment>/eval_results)')
     args = parser.parse_args()
     config = model_config()
 
@@ -206,7 +215,9 @@ def main():
                 # some models may not implement update
                 pass
 
-            if args.save:
+            if args.save and is_best:
+                # Only save the checkpoint when it's the best so far.
+                # save_checkpoint will also create a copy named checkpoint_best_loss.pth.tar
                 save_checkpoint(
                     {
                         "epoch": epoch + 1,
@@ -216,17 +227,78 @@ def main():
                         "aux_optimizer": aux_optimizer.state_dict(),
                         "lr_scheduler": lr_scheduler.state_dict(),
                     },
-                    is_best,
-                    os.path.join(ckpt_dir, "checkpoint_%03d.pth.tar" % (epoch + 1)),
+                    True,
+                    os.path.join(ckpt_dir, "checkpoint_best_loss.pth.tar"),
                 )
-                if is_best:
-                    logger_val.info('best checkpoint saved.')
+                logger_val.info('best checkpoint saved.')
 
         # close tensorboard writer for this lambda
         try:
             tb_logger.close()
         except Exception:
             pass
+
+        # Evaluation helper
+        def run_evaluation(checkpoint_path=None):
+            # Determine checkpoint
+            if checkpoint_path is None:
+                # choose best checkpoint if exists
+                candidate = os.path.join(ckpt_dir, 'checkpoint_best_loss.pth.tar')
+                if os.path.exists(candidate):
+                    checkpoint_path_local = candidate
+                else:
+                    # fallback to last epoch checkpoint
+                    checkpoints = sorted(Path(ckpt_dir).glob('checkpoint_*.pth.tar'))
+                    checkpoint_path_local = str(checkpoints[-1]) if checkpoints else None
+            else:
+                checkpoint_path_local = checkpoint_path
+
+            if checkpoint_path_local is None or not os.path.exists(checkpoint_path_local):
+                logger_val.error(f'No checkpoint found for evaluation at {checkpoint_path_local}')
+                return
+
+            save_dir = args.eval_save_dir or os.path.join(exp_dir, 'eval_results')
+            os.makedirs(save_dir, exist_ok=True)
+            # setup logger for eval
+            setup_logger(f'test_{l_str}', save_dir, 'test_log', level=logging.INFO, screen=True, tofile=True)
+            logger_test = logging.getLogger(f'test_{l_str}')
+
+            # load model
+            config_local = config
+            net_eval = MLICPlusPlus(config_local)
+            net_eval = net_eval.to(device)
+            ckpt = torch.load(checkpoint_path_local, map_location=device)
+            state = ckpt.get('state_dict', ckpt)
+            net_eval.load_state_dict(state)
+
+            # prepare dataloader
+            if args.eval_dataset is None:
+                logger_test.error('No eval dataset provided. Use --eval-dataset to set test data path.')
+                return
+            test_dataset = ImageFolder(args.eval_dataset, split='test', transform=transforms.ToTensor())
+            # attempt to sort samples by numeric filename if possible
+            try:
+                test_dataset.samples.sort(key=lambda x: int(Path(x).stem) if Path(x).stem.isdigit() else Path(x).stem)
+            except Exception:
+                pass
+
+            test_dataloader = torch.utils.data.DataLoader(
+                test_dataset,
+                batch_size=args.eval_batch_size,
+                num_workers=args.eval_num_workers,
+                shuffle=False,
+                pin_memory=(device == 'cuda')
+            )
+
+            # run evaluation using test_model helper
+            test_model(test_dataloader, net_eval, logger_test, save_dir, ckpt.get('epoch', 0))
+
+        # Run evaluation-only mode or evaluate after training
+        if args.eval_only:
+            run_evaluation(args.eval_checkpoint)
+        elif args.evaluate:
+            # evaluate the model saved for this lambda (best or provided)
+            run_evaluation(args.eval_checkpoint)
 
 
 
