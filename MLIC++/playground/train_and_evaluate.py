@@ -33,7 +33,8 @@ def main():
     parser.add_argument('-e', '--epochs', default=500, type=int, help="Number of epochs (default: %(default)s)")
     parser.add_argument('-lr', '--learning_rate', default=1e-4, type=float, help="Learning rate (default: %(default)s)")
     parser.add_argument('-n', '--num_workers', type=int, default=8, help="Dataloaders threads (default: %(default)s)")
-    parser.add_argument('--lambda', dest='lmbda', type=float, default=0.0018, help="Lambda for rate-distortion loss")
+    # Accept either a single float or a tuple/list-like string e.g. "(0.0018,0.003)" or "0.0018,0.003"
+    parser.add_argument('--lambda', dest='lmbda', type=str, default='0.0018', help="Lambda for rate-distortion loss. Use a single float or a comma/tuple-style list")
     parser.add_argument('--metrics', type=str, default="mse", help="Optimized for (default: %(default)s)")
     parser.add_argument('--batch-size', type=int, default=8, help="Batch size (default: %(default)s)")
     parser.add_argument('--test-batch-size', type=int, default=1, help="Test batch size (default: %(default)s)")
@@ -61,17 +62,25 @@ def main():
     import random
     random.seed(int(seed))
 
-    exp_dir = os.path.join('./experiments', args.experiment)
-    if not os.path.exists(exp_dir):
-        os.makedirs(exp_dir)
-    setup_logger('train', exp_dir, 'train_' + args.experiment, level=logging.INFO, screen=True, tofile=True)
-    setup_logger('val', exp_dir, 'val_' + args.experiment, level=logging.INFO, screen=True, tofile=True)
-    logger_train = logging.getLogger('train')
-    logger_val = logging.getLogger('val')
-    tb_logger = SummaryWriter(log_dir='./tb_logger/' + args.experiment)
+    # Parse lambda(s): support string forms like "(0.001, 0.002)", "0.001,0.002" or single "0.0018"
+    def parse_lambdas(s):
+        if isinstance(s, (list, tuple)):
+            return [float(x) for x in s]
+        raw = str(s).strip()
+        if raw.startswith('(') and raw.endswith(')'):
+            raw = raw[1:-1]
+        parts = [p.strip() for p in raw.split(',') if p.strip() != '']
+        try:
+            return [float(p) for p in parts]
+        except ValueError:
+            raise ValueError(f"Unable to parse --lambda value: {s}")
 
-    if not os.path.exists(os.path.join(exp_dir, 'checkpoints')):
-        os.makedirs(os.path.join(exp_dir, 'checkpoints'))
+    lmbda_list = parse_lambdas(args.lmbda)
+
+    # experiments root folder
+    experiments_root = './experiments'
+    if not os.path.exists(experiments_root):
+        os.makedirs(experiments_root)
 
     def safe_random_crop(image, size):
         """Safely perform a random crop, ensuring the crop size is not larger than the image size."""
@@ -116,61 +125,108 @@ def main():
         pin_memory=(device == "cuda"),
     )
 
-    net = MLICPlusPlus(config=config)
-    if args.cuda and torch.cuda.device_count() > 1:
-        net = CustomDataParallel(net)
-    net = net.to(device)
-    optimizer, aux_optimizer = configure_optimizers(net, args)
+    # Loop over lambda values and create one experiment per lambda
     import torch.optim as optim
-    lr_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[80, 100], gamma=0.1)
-    criterion = RateDistortionLoss(lmbda=args.lmbda, metrics=args.metrics)
+    import random as _random
+    for l in lmbda_list:
+        # format lambda string for folder/logger names
+        l_str = ('%g' % l).replace('.', 'p').replace('-', 'm')
+        exp_name = f"{args.experiment}_lambda_{l_str}"
+        exp_dir = os.path.join(experiments_root, exp_name)
+        os.makedirs(exp_dir, exist_ok=True)
 
-    start_epoch = 0
-    best_loss = 1e10
-    current_step = 0
+        # per-lambda loggers and tensorboard
+        setup_logger(f'train_{l_str}', exp_dir, 'train_' + exp_name, level=logging.INFO, screen=True, tofile=True)
+        setup_logger(f'val_{l_str}', exp_dir, 'val_' + exp_name, level=logging.INFO, screen=True, tofile=True)
+        logger_train = logging.getLogger(f'train_{l_str}')
+        logger_val = logging.getLogger(f'val_{l_str}')
+        tb_logger = SummaryWriter(log_dir=os.path.join('./tb_logger', exp_name))
 
-    logger_train.info(args)
-    logger_train.info(config)
-    logger_train.info(net)
-    logger_train.info(optimizer)
-    optimizer.param_groups[0]['lr'] = args.learning_rate
-    for epoch in range(start_epoch, args.epochs):
-        logger_train.info(f"Learning rate: {optimizer.param_groups[0]['lr']}")
-        current_step = train_one_epoch(
-            net,
-            criterion,
-            train_dataloader,
-            optimizer,
-            aux_optimizer,
-            epoch,
-            args.clip_max_norm,
-            logger_train,
-            tb_logger,
-            current_step
-        )
+        ckpt_dir = os.path.join(exp_dir, 'checkpoints')
+        os.makedirs(ckpt_dir, exist_ok=True)
 
-        loss = test_one_epoch(epoch, val_dataloader, net, criterion, logger_val, tb_logger)
+        # reset seeds for reproducibility per experiment
+        torch.manual_seed(int(seed))
+        _random.seed(int(seed))
 
-        lr_scheduler.step()
-        is_best = loss < best_loss
-        best_loss = min(loss, best_loss)
+        # build model, optimizers and criterion per lambda
+        net = MLICPlusPlus(config=config)
+        if args.cuda and torch.cuda.device_count() > 1:
+            net = CustomDataParallel(net)
+        net = net.to(device)
 
-        net.update(force=True)
-        if args.save:
-            save_checkpoint(
-                {
-                    "epoch": epoch + 1,
-                    "state_dict": net.state_dict(),
-                    "loss": loss,
-                    "optimizer": optimizer.state_dict(),
-                    "aux_optimizer": aux_optimizer.state_dict(),
-                    "lr_scheduler": lr_scheduler.state_dict(),
-                },
-                is_best,
-                os.path.join(exp_dir, 'checkpoints', "checkpoint_%03d.pth.tar" % (epoch + 1))
+        if args.checkpoint:
+            try:
+                ckpt = torch.load(args.checkpoint, map_location=device)
+                state = ckpt.get('state_dict', ckpt)
+                net.load_state_dict(state)
+                logger_train.info(f'Loaded checkpoint {args.checkpoint}')
+            except Exception as e:
+                logger_train.warning(f'Could not load checkpoint {args.checkpoint}: {e}')
+
+        optimizer, aux_optimizer = configure_optimizers(net, args)
+        lr_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[80, 100], gamma=0.1)
+        criterion = RateDistortionLoss(lmbda=l, metrics=args.metrics)
+
+        start_epoch = 0
+        best_loss = 1e10
+        current_step = 0
+
+        logger_train.info(args)
+        logger_train.info(config)
+        logger_train.info(net)
+        logger_train.info(optimizer)
+        optimizer.param_groups[0]['lr'] = args.learning_rate
+
+        for epoch in range(start_epoch, args.epochs):
+            logger_train.info(f"Learning rate: {optimizer.param_groups[0]['lr']}")
+            current_step = train_one_epoch(
+                net,
+                criterion,
+                train_dataloader,
+                optimizer,
+                aux_optimizer,
+                epoch,
+                args.clip_max_norm,
+                logger_train,
+                tb_logger,
+                current_step,
             )
-            if is_best:
-                logger_val.info('best checkpoint saved.')
+
+            loss = test_one_epoch(epoch, val_dataloader, net, criterion, logger_val, tb_logger)
+
+            lr_scheduler.step()
+            is_best = loss < best_loss
+            best_loss = min(loss, best_loss)
+
+            # update and save
+            try:
+                net.update(force=True)
+            except Exception:
+                # some models may not implement update
+                pass
+
+            if args.save:
+                save_checkpoint(
+                    {
+                        "epoch": epoch + 1,
+                        "state_dict": net.state_dict(),
+                        "loss": loss,
+                        "optimizer": optimizer.state_dict(),
+                        "aux_optimizer": aux_optimizer.state_dict(),
+                        "lr_scheduler": lr_scheduler.state_dict(),
+                    },
+                    is_best,
+                    os.path.join(ckpt_dir, "checkpoint_%03d.pth.tar" % (epoch + 1)),
+                )
+                if is_best:
+                    logger_val.info('best checkpoint saved.')
+
+        # close tensorboard writer for this lambda
+        try:
+            tb_logger.close()
+        except Exception:
+            pass
 
 
 
