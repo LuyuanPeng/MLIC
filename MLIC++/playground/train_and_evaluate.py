@@ -22,6 +22,7 @@ from models import *
 from torchvision.transforms import functional as F
 from pathlib import Path
 import json
+import glob
 
 def main():
     torch.backends.cudnn.benchmark = True
@@ -29,7 +30,7 @@ def main():
     Image.MAX_IMAGE_PIXELS = None
 
     parser = argparse.ArgumentParser(description="Train and evaluate script.")
-    parser.add_argument('--train_dataset', type=str, required=True, help='Path to training dataset')
+    parser.add_argument('--train_dataset', type=str, required=False, help='Path to training dataset (required unless --eval-only)')
     # Add all train_options arguments except dataset
     parser.add_argument('-exp', '--experiment', default="mlicplus0018mse", type=str, help="Experiment name")
     parser.add_argument('-e', '--epochs', default=500, type=int, help="Number of epochs (default: %(default)s)")
@@ -72,6 +73,17 @@ def main():
     import random
     random.seed(int(seed))
 
+    # Validate dataset arguments according to modes:
+    # - If --eval-only is set, --train_dataset is not required but --eval-dataset must be provided
+    # - If not eval-only, training requires --train_dataset
+    if args.eval_only:
+        if args.eval_dataset is None:
+            parser.error("--eval-only requires --eval-dataset to be specified (path to eval images)")
+    else:
+        # not eval-only -> training mode
+        if args.train_dataset is None:
+            parser.error("Training mode requires --train_dataset to be specified (or run with --eval-only)")
+
     # Parse lambda(s): support string forms like "(0.001, 0.002)", "0.001,0.002" or single "0.0018"
     def parse_lambdas(s):
         if isinstance(s, (list, tuple)):
@@ -91,6 +103,135 @@ def main():
     experiments_root = './experiments'
     if not os.path.exists(experiments_root):
         os.makedirs(experiments_root)
+
+    # If eval-only mode, allow running evaluation by only providing --eval-dataset and --experiment
+    if args.eval_only:
+        # require eval dataset
+        if args.eval_dataset is None:
+            parser.error("--eval-only requires --eval-dataset to be specified (path to eval images)")
+
+        # find experiment folders matching the experiment name prefix
+        pattern = os.path.join(experiments_root, f"{args.experiment}*")
+        exp_dirs = sorted(glob.glob(pattern))
+        # filter to directories only
+        exp_dirs = [d for d in exp_dirs if os.path.isdir(d)]
+
+        # if no matching experiment directories, try exact match under experiments_root
+        if not exp_dirs:
+            direct = os.path.join(experiments_root, args.experiment)
+            if os.path.isdir(direct):
+                exp_dirs = [direct]
+
+        # If the user provided a single explicit checkpoint, evaluate that and exit
+        if args.eval_checkpoint is not None and not exp_dirs:
+            # evaluate the single checkpoint
+            exp_dir = os.path.join(experiments_root, args.experiment)
+            ckpt_path = args.eval_checkpoint
+            if args.eval_save_dir:
+                eval_subdir = os.path.basename(os.path.normpath(args.eval_save_dir))
+                save_dir = os.path.join(exp_dir, eval_subdir)
+            else:
+                save_dir = os.path.join(exp_dir, 'eval_results')
+            os.makedirs(save_dir, exist_ok=True)
+            setup_logger(f'test_{args.experiment}', save_dir, 'test_log', level=logging.INFO, screen=True, tofile=True)
+            logger_test = logging.getLogger(f'test_{args.experiment}')
+            # load model and run evaluation
+            config_local = config
+            net_eval = MLICPlusPlus(config_local)
+            net_eval = net_eval.to(device)
+            ckpt = torch.load(ckpt_path, map_location=device)
+            state = ckpt.get('state_dict', ckpt)
+            net_eval.load_state_dict(state)
+            test_dataset = ImageFolder(args.eval_dataset, split='test', transform=transforms.ToTensor())
+            try:
+                test_dataset.samples.sort(key=lambda x: int(Path(x).stem) if Path(x).stem.isdigit() else Path(x).stem)
+            except Exception:
+                pass
+            test_dataloader = torch.utils.data.DataLoader(
+                test_dataset,
+                batch_size=args.eval_batch_size,
+                num_workers=args.eval_num_workers,
+                shuffle=False,
+                pin_memory=(device == 'cuda')
+            )
+            test_model(test_dataloader, net_eval, logger_test, save_dir, ckpt.get('epoch', 0))
+            # write summary
+            summary = {
+                'experiment': args.experiment,
+                'checkpoint': os.path.abspath(ckpt_path),
+                'eval_save_dir': os.path.abspath(save_dir),
+            }
+            try:
+                summary_path = os.path.join(exp_dir, 'eval_summary.json')
+                with open(summary_path, 'w') as f:
+                    json.dump(summary, f, indent=2)
+                logger_test.info(f'Evaluation summary written to {summary_path}')
+            except Exception as e:
+                logger_test.warning(f'Could not write evaluation summary: {e}')
+            return
+
+        if not exp_dirs:
+            parser.error(f'No experiment folders matching "{args.experiment}" found under {experiments_root}.')
+
+        # iterate matching experiment dirs and evaluate their best checkpoint
+        for exp_dir in exp_dirs:
+            exp_name = os.path.basename(exp_dir)
+            ckpt_dir = os.path.join(exp_dir, 'checkpoints')
+            candidate = os.path.join(ckpt_dir, 'checkpoint_best_loss.pth.tar')
+            if os.path.exists(candidate):
+                ckpt_path = candidate
+            else:
+                checkpoints = sorted(Path(ckpt_dir).glob('checkpoint_*.pth.tar'))
+                ckpt_path = str(checkpoints[-1]) if checkpoints else None
+            if ckpt_path is None or not os.path.exists(ckpt_path):
+                print(f"No checkpoint found for {exp_name} under {ckpt_dir} -> skipping")
+                continue
+            if args.eval_save_dir:
+                eval_subdir = os.path.basename(os.path.normpath(args.eval_save_dir))
+                save_dir = os.path.join(exp_dir, eval_subdir)
+            else:
+                save_dir = os.path.join(exp_dir, 'eval_results')
+            os.makedirs(save_dir, exist_ok=True)
+            setup_logger(f'test_{exp_name}', save_dir, 'test_log', level=logging.INFO, screen=True, tofile=True)
+            logger_test = logging.getLogger(f'test_{exp_name}')
+            # load model
+            config_local = config
+            net_eval = MLICPlusPlus(config_local)
+            net_eval = net_eval.to(device)
+            ckpt = torch.load(ckpt_path, map_location=device)
+            state = ckpt.get('state_dict', ckpt)
+            net_eval.load_state_dict(state)
+            # prepare dataloader
+            test_dataset = ImageFolder(args.eval_dataset, split='test', transform=transforms.ToTensor())
+            try:
+                test_dataset.samples.sort(key=lambda x: int(Path(x).stem) if Path(x).stem.isdigit() else Path(x).stem)
+            except Exception:
+                pass
+            test_dataloader = torch.utils.data.DataLoader(
+                test_dataset,
+                batch_size=args.eval_batch_size,
+                num_workers=args.eval_num_workers,
+                shuffle=False,
+                pin_memory=(device == 'cuda')
+            )
+            # run evaluation
+            test_model(test_dataloader, net_eval, logger_test, save_dir, ckpt.get('epoch', 0))
+            # write summary
+            summary = {
+                'experiment': exp_name,
+                'checkpoint': os.path.abspath(ckpt_path),
+                'checkpoint_epoch': int(ckpt.get('epoch', 0)) if ckpt is not None else None,
+                'checkpoint_loss': float(ckpt.get('loss')) if ckpt is not None and 'loss' in ckpt else None,
+                'eval_save_dir': os.path.abspath(save_dir),
+            }
+            try:
+                summary_path = os.path.join(exp_dir, 'eval_summary.json')
+                with open(summary_path, 'w') as f:
+                    json.dump(summary, f, indent=2)
+                logger_test.info(f'Evaluation summary written to {summary_path}')
+            except Exception as e:
+                logger_test.warning(f'Could not write evaluation summary: {e}')
+        return
 
     def safe_random_crop(image, size):
         """Safely perform a random crop, ensuring the crop size is not larger than the image size."""
@@ -116,24 +257,28 @@ def main():
         transforms.ToTensor()
     ])
 
-    train_dataset = ImageFolder(args.train_dataset, split="train", transform=train_transforms)
-    val_dataset = ImageFolder(args.train_dataset, split="valid", transform=test_transforms)
+    # Only prepare training dataloaders when not running eval-only
+    if not args.eval_only:
+        train_dataset = ImageFolder(args.train_dataset, split="train", transform=train_transforms)
+        val_dataset = ImageFolder(args.train_dataset, split="valid", transform=test_transforms)
 
-
-    train_dataloader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        shuffle=True,
-        pin_memory=(device == "cuda"),
-    )
-    val_dataloader = DataLoader(
-        val_dataset,
-        batch_size=args.test_batch_size,
-        num_workers=args.num_workers,
-        shuffle=False,
-        pin_memory=(device == "cuda"),
-    )
+        train_dataloader = DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            shuffle=True,
+            pin_memory=(device == "cuda"),
+        )
+        val_dataloader = DataLoader(
+            val_dataset,
+            batch_size=args.test_batch_size,
+            num_workers=args.num_workers,
+            shuffle=False,
+            pin_memory=(device == "cuda"),
+        )
+    else:
+        train_dataloader = None
+        val_dataloader = None
 
     # Loop over lambda values and create one experiment per lambda
     import torch.optim as optim
@@ -141,7 +286,7 @@ def main():
     for l in lmbda_list:
         # format lambda string for folder/logger names
         l_str = ('%g' % l).replace('.', 'p').replace('-', 'm')
-        exp_name = f"{args.experiment}_lambda_{l_str}"
+        exp_name = f"{args.experiment}_{l_str}"
         exp_dir = os.path.join(experiments_root, exp_name)
         os.makedirs(exp_dir, exist_ok=True)
 
@@ -154,6 +299,98 @@ def main():
 
         ckpt_dir = os.path.join(exp_dir, 'checkpoints')
         os.makedirs(ckpt_dir, exist_ok=True)
+
+        # Evaluation helper (moved up so we can support eval-only without building/train)
+        def run_evaluation(checkpoint_path=None):
+            # Determine checkpoint
+            if checkpoint_path is None:
+                # choose best checkpoint if exists
+                candidate = os.path.join(ckpt_dir, 'checkpoint_best_loss.pth.tar')
+                if os.path.exists(candidate):
+                    checkpoint_path_local = candidate
+                else:
+                    # fallback to last epoch checkpoint
+                    checkpoints = sorted(Path(ckpt_dir).glob('checkpoint_*.pth.tar'))
+                    checkpoint_path_local = str(checkpoints[-1]) if checkpoints else None
+            else:
+                checkpoint_path_local = checkpoint_path
+
+            if checkpoint_path_local is None or not os.path.exists(checkpoint_path_local):
+                logger_val.error(f'No checkpoint found for evaluation at {checkpoint_path_local}')
+                return None
+
+            if args.eval_save_dir:
+                eval_subdir = os.path.basename(os.path.normpath(args.eval_save_dir))
+                save_dir = os.path.join(exp_dir, eval_subdir)
+            else:
+                save_dir = os.path.join(exp_dir, 'eval_results')
+            os.makedirs(save_dir, exist_ok=True)
+            # setup logger for eval
+            setup_logger(f'test_{l_str}', save_dir, 'test_log', level=logging.INFO, screen=True, tofile=True)
+            logger_test = logging.getLogger(f'test_{l_str}')
+
+            # load model
+            config_local = config
+            net_eval = MLICPlusPlus(config_local)
+            net_eval = net_eval.to(device)
+            ckpt = torch.load(checkpoint_path_local, map_location=device)
+            state = ckpt.get('state_dict', ckpt)
+            net_eval.load_state_dict(state)
+
+            # prepare dataloader
+            if args.eval_dataset is None:
+                logger_test.error('No eval dataset provided. Use --eval-dataset to set test data path.')
+                return
+            test_dataset = ImageFolder(args.eval_dataset, split='test', transform=transforms.ToTensor())
+            # attempt to sort samples by numeric filename if possible
+            try:
+                test_dataset.samples.sort(key=lambda x: int(Path(x).stem) if Path(x).stem.isdigit() else Path(x).stem)
+            except Exception:
+                pass
+
+            test_dataloader = torch.utils.data.DataLoader(
+                test_dataset,
+                batch_size=args.eval_batch_size,
+                num_workers=args.eval_num_workers,
+                shuffle=False,
+                pin_memory=(device == 'cuda')
+            )
+
+            # run evaluation using test_model helper
+            test_model(test_dataloader, net_eval, logger_test, save_dir, ckpt.get('epoch', 0))
+
+            # Collect summary information (checkpoint info + eval folder). test_model currently logs metrics
+            summary = {
+                'lambda': l,
+                'checkpoint': os.path.abspath(checkpoint_path_local),
+                'checkpoint_epoch': int(ckpt.get('epoch', 0)) if ckpt is not None else None,
+                'checkpoint_loss': float(ckpt.get('loss')) if ckpt is not None and 'loss' in ckpt else None,
+                'eval_save_dir': os.path.abspath(save_dir),
+                'eval_metrics': None  # placeholder; test_model logs metrics but does not return structured metrics
+            }
+
+            # write summary json into experiment folder
+            try:
+                summary_path = os.path.join(exp_dir, 'eval_summary.json')
+                with open(summary_path, 'w') as f:
+                    json.dump(summary, f, indent=2)
+                logger_test.info(f'Evaluation summary written to {summary_path}')
+            except Exception as e:
+                logger_test.warning(f'Could not write evaluation summary: {e}')
+
+            return summary
+
+        # If eval-only, run evaluation and skip training entirely for this lambda
+        if args.eval_only:
+            logger_val.info(f'Running eval-only for {exp_name} using dataset {args.eval_dataset}')
+            summary = run_evaluation(args.eval_checkpoint)
+            # close tensorboard writer for this lambda
+            try:
+                tb_logger.close()
+            except Exception:
+                pass
+            # move to next lambda
+            continue
 
         # reset seeds for reproducibility per experiment
         torch.manual_seed(int(seed))
@@ -315,12 +552,9 @@ def main():
 
             return summary
 
-        # Run evaluation-only mode or evaluate after training
-        if args.eval_only:
-            summary = run_evaluation(args.eval_checkpoint)
-            # if eval_only, we can write/print the summary (already written inside run_evaluation)
-        elif args.evaluate:
-            # evaluate the model saved for this lambda (best or provided)
+        # Run evaluation-only mode was handled earlier (we continue'd).
+        # If an eval dataset is provided, run evaluation now (after training)
+        if args.eval_dataset is not None and not args.eval_only:
             summary = run_evaluation(args.eval_checkpoint)
 
 
